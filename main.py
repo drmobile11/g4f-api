@@ -1,27 +1,30 @@
+#!/usr/bin/env python3
+"""
+G4F Optimized API - Using only curated working models from models_group.json
+Implements proper provider rotation for each model with no authentication required
+"""
+
 import asyncio
 import json
 import logging
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Union, AsyncGenerator, Any
-
+from collections import defaultdict
 import g4f
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 # Request Models (OpenAI Compatible)
 class ChatMessage(BaseModel):
     role: str = Field(..., description="Role of the message (system, user, assistant)")
     content: str = Field(..., description="Content of the message")
-
 
 class ChatCompletionRequest(BaseModel):
     model: str = Field(..., description="Model ID to use for the completion")
@@ -33,19 +36,16 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = Field(0.0, description="Presence penalty")
     frequency_penalty: Optional[float] = Field(0.0, description="Frequency penalty")
 
-
 # Response Models (OpenAI Compatible)
 class ChatChoice(BaseModel):
     index: int
     message: ChatMessage
     finish_reason: str
 
-
 class ChatUsage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
-
 
 class ChatCompletionResponse(BaseModel):
     id: str
@@ -55,176 +55,22 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatChoice]
     usage: ChatUsage
 
-
 class ModelInfo(BaseModel):
     id: str
     object: str = "model"
     created: int
     owned_by: str
-
+    category: Optional[str] = None
 
 class ModelsResponse(BaseModel):
     object: str = "list"
     data: List[ModelInfo]
 
-
-# Load provider to model mapping from working models list
-async def fetch_working_models():
-    """Fetch working models from GitHub repository"""
-    working_url = "https://raw.githubusercontent.com/maruf009sultan/g4f-working/refs/heads/main/working/working_results.txt"
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(working_url)
-            if response.status_code == 200:
-                lines = response.text.strip().split('\n')
-                return lines
-    except Exception as e:
-        logger.error(f"Failed to fetch working models: {e}")
-    return []
-
-
-def parse_working_models(lines: List[str]) -> Dict[str, List[tuple]]:
-    """Parse working models and build PROVIDER_MODEL_MAP"""
-    PROVIDER_MODEL_MAP = {}
-    excluded_providers = {"HuggingSpace", "PerplexityLabs"}
-    
-    # Parse each line
-    for line in lines:
-        if not line.strip():
-            continue
-        
-        parts = line.strip().split('|')
-        if len(parts) >= 3:
-            provider, model_id, modality = parts[0], parts[1], parts[2]
-            
-            # Skip excluded providers
-            if provider in excluded_providers:
-                continue
-            
-            # Add to PROVIDER_MODEL_MAP
-            if model_id not in PROVIDER_MODEL_MAP:
-                PROVIDER_MODEL_MAP[model_id] = []
-            
-            # Avoid duplicates
-            if (provider, model_id) not in PROVIDER_MODEL_MAP[model_id]:
-                PROVIDER_MODEL_MAP[model_id].append((provider, model_id))
-    
-    # Add default fallback
-    PROVIDER_MODEL_MAP["default"] = [("AnyProvider", "default"), ("PollinationsAI", "openai")]
-    
-    return PROVIDER_MODEL_MAP
-
-
-# Load working models at startup
-try:
-    import httpx
-    import asyncio
-    
-    # For now, we'll load from the saved working models file
-    # In production, you might want to fetch directly from GitHub
-    try:
-        with open('models.json', 'r') as f:
-            models_data = json.load(f)
-        
-        # Build PROVIDER_MODEL_MAP from working models with proper provider grouping
-        PROVIDER_MODEL_MAP = {}
-        excluded_providers = {"HuggingSpace", "PerplexityLabs"}
-        
-        for model_info in models_data.get('data', []):
-            model_id = model_info.get('id')
-            main_provider = model_info.get('owned_by', 'AnyProvider')
-            
-            if model_id:
-                if model_id not in PROVIDER_MODEL_MAP:
-                    PROVIDER_MODEL_MAP[model_id] = []
-                
-                # Add main provider first (if not excluded)
-                if main_provider not in excluded_providers:
-                    # Special handling for GLM models - use uppercase model ID for GLM provider
-                    if main_provider == "GLM" and model_id.startswith("glm-"):
-                        glm_model_id = model_id.replace("glm-", "GLM-").replace("4.5", "4.5")
-                        PROVIDER_MODEL_MAP[model_id].append((main_provider, glm_model_id))
-                    else:
-                        PROVIDER_MODEL_MAP[model_id].append((main_provider, model_id))
-                
-                # Add additional providers from the providers array
-                additional_providers = model_info.get('providers', [])
-                for additional in additional_providers:
-                    additional_provider = additional.get('provider')
-                    additional_model_id = additional.get('model_id', model_id)
-                    
-                    if additional_provider and additional_provider not in excluded_providers:
-                        # Special handling for GLM models
-                        if additional_provider == "GLM" and model_id.startswith("glm-"):
-                            glm_model_id = model_id.replace("glm-", "GLM-").replace("4.5", "4.5")
-                            if (additional_provider, glm_model_id) not in PROVIDER_MODEL_MAP[model_id]:
-                                PROVIDER_MODEL_MAP[model_id].append((additional_provider, glm_model_id))
-                        else:
-                            if (additional_provider, additional_model_id) not in PROVIDER_MODEL_MAP[model_id]:
-                                PROVIDER_MODEL_MAP[model_id].append((additional_provider, additional_model_id))
-                
-                # Always add AnyProvider as fallback if not already present
-                any_provider_exists = any(provider == "AnyProvider" for provider, _ in PROVIDER_MODEL_MAP[model_id])
-                if not any_provider_exists:
-                    PROVIDER_MODEL_MAP[model_id].append(("AnyProvider", model_id))
-        
-        # Add default fallback
-        PROVIDER_MODEL_MAP["default"] = [("AnyProvider", "default"), ("PollinationsAI", "openai")]
-        
-        logger.info(f"Loaded {len(PROVIDER_MODEL_MAP)} models from working models list")
-        
-        # Debug: Log first few models to verify loading
-        sample_models = list(PROVIDER_MODEL_MAP.keys())[:10]
-        logger.info(f"Sample models loaded: {sample_models}")
-        
-        # Debug: Check if common models exist
-        test_models = ["gpt-4", "gpt-4o-mini", "deepseek-v3", "qwen-max-latest"]
-        for test_model in test_models:
-            if test_model in PROVIDER_MODEL_MAP:
-                providers = [p[0] for p in PROVIDER_MODEL_MAP[test_model]]
-                logger.info(f"Model '{test_model}' has providers: {providers}")
-            else:
-                logger.warning(f"Model '{test_model}' NOT FOUND in PROVIDER_MODEL_MAP")
-        
-    except FileNotFoundError:
-        logger.warning("models.json not found, using default mapping")
-        PROVIDER_MODEL_MAP = {
-            "default": [("AnyProvider", "default"), ("PollinationsAI", "openai")]
-        }
-except Exception as e:
-    logger.error(f"Error loading working models: {e}")
-    PROVIDER_MODEL_MAP = {
-        "default": [("AnyProvider", "default"), ("PollinationsAI", "openai")]
-    }
-
-
-# Model aliases for common naming variations
-MODEL_ALIASES = {
-    "gpt-4-turbo": "gpt-4",
-    "gpt-4-turbo-preview": "gpt-4",
-    "gpt-3.5-turbo": "gpt-4o-mini",
-    "claude-3": "command-r",
-    "claude-3-sonnet": "command-r",
-    "claude-3-opus": "command-r-plus",
-    "claude-3-haiku": "command-a",
-    "gemini": "gemini-2.5-flash-lite",
-    "gemini-pro": "gemini-2.5-flash-lite",
-    "gemini-1.5-pro": "gemini-2.5-flash-lite",
-    "llama-2": "llama-3.3-70b",
-    "llama-3": "llama-3.3-70b",
-    "llama-2-70b": "llama-3.3-70b",
-    "llama-3-70b": "llama-3.3-70b",
-    "mixtral": "mistral-small-3.1-24b",
-    "mixtral-8x7b": "mistral-small-3.1-24b",
-    "deepseek": "deepseek-v3",
-    "qwen": "qwen-max-latest",
-}
-
-
+# FastAPI app
 app = FastAPI(
-    title="G4F OpenAI Compatible API",
-    description="OpenAI-compatible API server using G4F with automatic provider routing",
-    version="1.0.0"
+    title="G4F Optimized API",
+    description="Curated working models with free provider rotation - No authentication required",
+    version="3.0.0"
 )
 
 # Add CORS middleware
@@ -236,72 +82,141 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Free providers that don't require authentication (ordered by reliability)
+FREE_PROVIDERS = [
+    "PollinationsAI",
+    "WeWordle", 
+    "Yqcloud",
+    "CohereForAI_C4AI_Command",
+    "LambdaChat",
+    "OIVSCodeSer0501",
+    "OIVSCodeSer2",
+    "GLM",
+    "Qwen",
+    "DeepInfra",
+    "AnyProvider"  # Fallback
+]
 
-def normalize_model_name(model: str) -> str:
-    """Normalize model name and resolve aliases"""
-    model = model.lower().strip()
-    
-    # Handle provider/model format (e.g., "deepseek/DeepSeek-R1-0528-Turbo")
-    if "/" in model:
-        provider_hint, model_name = model.split("/", 1)
-        # Try to find the model without provider prefix first
-        model_name = model_name.lower()
-        return MODEL_ALIASES.get(model_name, model_name)
-    
-    return MODEL_ALIASES.get(model, model)
+# Load curated models from models_group.json
+CURATED_MODELS = {}
+MODEL_CATEGORIES = {}
+AVAILABLE_MODELS = {}
 
-
-def get_available_providers(model: str) -> List[tuple]:
-    """Get list of available (provider, model_id) pairs for a given model"""
-    original_model = model.lower().strip()
-    provider_hint = None
+def load_curated_models():
+    """Load only curated working models from models_group.json"""
+    global CURATED_MODELS, MODEL_CATEGORIES, AVAILABLE_MODELS
     
-    # Extract provider hint if present (e.g., "deepseek/DeepSeek-R1-0528-Turbo")
-    if "/" in original_model:
-        provider_hint, _ = original_model.split("/", 1)
-    
-    normalized_model = normalize_model_name(model)
-    provider_model_pairs = PROVIDER_MODEL_MAP.get(normalized_model, PROVIDER_MODEL_MAP["default"])
-    
-    # If we have a provider hint, prioritize that provider
-    if provider_hint:
-        prioritized_pairs = []
-        other_pairs = []
+    try:
+        with open('models_group.json', 'r') as f:
+            groups = json.load(f)
         
-        for provider_name, model_id in provider_model_pairs:
-            if provider_name.lower() == provider_hint:
-                prioritized_pairs.append((provider_name, model_id))
-            else:
-                other_pairs.append((provider_name, model_id))
+        # Flatten all models and track categories
+        all_models = set()
+        for category, models in groups.items():
+            for model in models:
+                model_id = model.strip()
+                all_models.add(model_id)
+                MODEL_CATEGORIES[model_id] = category.replace('_models', '')
         
-        # Use prioritized pairs first, then fallback to others
-        provider_model_pairs = prioritized_pairs + other_pairs
-    
-    # Convert provider names to actual provider objects and keep model IDs
+        # Create provider mapping for each curated model
+        for model_id in all_models:
+            CURATED_MODELS[model_id] = get_providers_for_model(model_id)
+            AVAILABLE_MODELS[model_id] = {
+                'id': model_id,
+                'object': 'model',
+                'created': int(time.time()),
+                'owned_by': 'g4f',
+                'category': MODEL_CATEGORIES.get(model_id, 'general')
+            }
+        
+        logger.info(f"✅ Loaded {len(CURATED_MODELS)} curated models:")
+        logger.info(f"   📝 Coding: {len(groups.get('coding_models', []))} models")
+        logger.info(f"   💬 Chat: {len(groups.get('chat_models', []))} models") 
+        logger.info(f"   🧠 Deep Thinking: {len(groups.get('deep_thinking_models', []))} models")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load models_group.json: {e}")
+        # Fallback to basic models
+        CURATED_MODELS = {
+            "gpt-4": get_providers_for_model("gpt-4"),
+            "command-r": get_providers_for_model("command-r")
+        }
+        AVAILABLE_MODELS = {
+            "gpt-4": {'id': 'gpt-4', 'object': 'model', 'created': int(time.time()), 'owned_by': 'g4f', 'category': 'chat'},
+            "command-r": {'id': 'command-r', 'object': 'model', 'created': int(time.time()), 'owned_by': 'g4f', 'category': 'chat'}
+        }
+
+def get_providers_for_model(model_id: str) -> List[tuple]:
+    """Get free providers that support the specific model"""
     providers = []
-    for provider_name, model_id in provider_model_pairs:
+    
+    # Special handling for different model types
+    if "gpt-4" in model_id.lower():
+        # GPT-4 variants work with these providers
+        provider_names = ["WeWordle", "Yqcloud", "PollinationsAI", "AnyProvider"]
+    elif "command" in model_id.lower():
+        # Command models work with Cohere providers
+        provider_names = ["CohereForAI_C4AI_Command", "AnyProvider"]
+    elif "deepseek" in model_id.lower():
+        # DeepSeek models
+        provider_names = ["DeepInfra", "AnyProvider"]
+    elif "qwen" in model_id.lower():
+        # Qwen models - based on working model analysis
+        if model_id in ["Qwen/Qwen3-Coder-480B-A35B-Instruct", "Qwen/Qwen3-Coder-480B-A35B-Instruct-Turbo"]:
+            provider_names = ["DeepInfra", "AnyProvider"]  # These work with DeepInfra
+        elif model_id in ["qwen-3-14b", "qwen-3-30b", "qwen-3-32b"]:
+            provider_names = ["AnyProvider"]  # These work with AnyProvider
+        elif model_id == "qwq-32b":
+            provider_names = ["Qwen", "AnyProvider"]  # This works with Qwen provider
+        elif model_id == "qwen3-32b-fp8":
+            provider_names = ["AnyProvider"]  # This works with g4f auto-selection
+        else:
+            provider_names = ["AnyProvider"]  # Fallback for other Qwen models
+    elif "glm" in model_id.lower() or "chatglm" in model_id.lower():
+        # GLM models
+        provider_names = ["GLM", "AnyProvider"]
+    elif "llama" in model_id.lower():
+        # Llama models
+        provider_names = ["DeepInfra", "LambdaChat", "AnyProvider"]
+    elif "phi" in model_id.lower():
+        # Phi models
+        provider_names = ["DeepInfra", "AnyProvider"]
+    else:
+        # Default providers for other models
+        provider_names = ["PollinationsAI", "DeepInfra", "AnyProvider"]
+    
+    # Convert provider names to actual provider objects
+    for provider_name in provider_names:
         try:
-            # Handle special case for AnyProvider (use None to let g4f auto-select)
             if provider_name == "AnyProvider":
-                providers.append((None, model_id))
+                providers.append((None, model_id))  # None = let g4f auto-select
                 continue
                 
-            provider = getattr(g4f.Provider, provider_name, None)
-            if provider:
-                providers.append((provider, model_id))
+            provider_class = getattr(g4f.Provider, provider_name, None)
+            if provider_class:
+                # Special model ID handling for specific providers
+                if provider_name == "GLM" and model_id.lower().startswith(("glm", "chatglm")):
+                    # GLM provider expects uppercase format
+                    if model_id.lower() == "chatglm":
+                        glm_model = "ChatGLM"
+                    elif "glm-4.5" in model_id.lower():
+                        glm_model = "GLM-4.5"
+                    else:
+                        glm_model = model_id.replace("glm-", "GLM-")
+                    providers.append((provider_class, glm_model))
+                elif provider_name == "DeepInfra" and "/" not in model_id:
+                    # DeepInfra might need full model path for some models
+                    providers.append((provider_class, model_id))
+                else:
+                    providers.append((provider_class, model_id))
             else:
-                logger.warning(f"Provider {provider_name} not found in g4f.Provider, skipping")
+                logger.debug(f"Provider {provider_name} not found")
                 
         except AttributeError:
-            logger.warning(f"Provider {provider_name} not found in g4f.Provider, skipping")
+            logger.debug(f"Provider {provider_name} not available")
             continue
     
-    # Ensure we have at least one provider
-    if not providers:
-        providers = [(None, model)]  # Let g4f auto-select
-    
     return providers
-
 
 def create_openai_error(message: str, error_type: str = "service_unavailable", param: str = None, code: int = None) -> dict:
     """Create OpenAI-compatible error response"""
@@ -314,123 +229,178 @@ def create_openai_error(message: str, error_type: str = "service_unavailable", p
         }
     }
 
-async def try_providers(model: str, messages: List[dict], providers: List[tuple], **kwargs) -> str:
-    """Try providers in order until one succeeds"""
-    for provider, provider_model in providers:
-        try:
-            logger.info(f"Trying provider: {provider} with model: {provider_model}")
-            
-            response = await asyncio.to_thread(
-                g4f.ChatCompletion.create,
-                model=provider_model,
-                messages=messages,
-                provider=provider,
-                stream=False
-            )
-            
-            if response and isinstance(response, str):
-                logger.info(f"Success with provider: {provider}")
-                return response
-                
-        except Exception as e:
-            logger.warning(f"Provider {provider} failed: {str(e)}")
-            continue
-    
-    # Raise HTTPException, will be caught and converted to JSONResponse in the endpoint
-    raise HTTPException(
-        status_code=503,
-        detail="All providers failed. Please try again later."
-    )
-
-
 class StreamingError(Exception):
-    """Exception to signal streaming provider failure"""
+    """Custom exception for streaming errors"""
     def __init__(self, message: str, error_type: str = "service_unavailable", code: int = 503):
         self.message = message
         self.error_type = error_type
         self.code = code
         super().__init__(message)
 
-async def try_providers_stream(model: str, messages: List[dict], providers: List[tuple], **kwargs) -> AsyncGenerator[str, None]:
-    """Try providers in order for streaming until one succeeds"""
-    for provider, provider_model in providers:
+async def try_providers(model: str, messages: List[dict], providers: List[tuple], **kwargs) -> str:
+    """Try providers in order until one succeeds"""
+    last_error = None
+    
+    for i, (provider, provider_model) in enumerate(providers):
         try:
-            logger.info(f"Trying streaming provider: {provider} with model: {provider_model}")
+            provider_name = provider.__name__ if provider else "AnyProvider"
+            logger.info(f"🔄 [{i+1}/{len(providers)}] Trying {provider_name} with model: {provider_model}")
+            
+            response = await asyncio.to_thread(
+                g4f.ChatCompletion.create,
+                model=provider_model,
+                messages=messages,
+                provider=provider,
+                stream=False,
+                **kwargs
+            )
+            
+            if response and isinstance(response, str) and response.strip():
+                logger.info(f"✅ SUCCESS: {provider_name} responded with {len(response)} chars")
+                return response
+            else:
+                logger.warning(f"⚠️ Empty response from {provider_name}")
+                last_error = f"Empty response from {provider_name}"
+                
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"❌ {provider_name} failed: {error_msg[:100]}")
+            last_error = error_msg
+            continue
+    
+    # All providers failed
+    raise HTTPException(
+        status_code=503,
+        detail=f"All {len(providers)} providers failed for model '{model}'. Last error: {last_error}"
+    )
+
+async def try_providers_stream(model: str, messages: List[dict], providers: List[tuple], **kwargs) -> AsyncGenerator[str, None]:
+    """Try providers for streaming"""
+    last_error = None
+    
+    for i, (provider, provider_model) in enumerate(providers):
+        try:
+            provider_name = provider.__name__ if provider else "AnyProvider"
+            logger.info(f"🔄 [{i+1}/{len(providers)}] Streaming {provider_name} with model: {provider_model}")
             
             response = g4f.ChatCompletion.create(
                 model=provider_model,
                 messages=messages,
                 provider=provider,
-                stream=True
+                stream=True,
+                **kwargs
             )
             
+            chunk_count = 0
             for chunk in response:
-                if chunk and isinstance(chunk, str):
+                if chunk and isinstance(chunk, str) and chunk.strip():
+                    chunk_count += 1
+                    if chunk_count == 1:
+                        logger.info(f"✅ STREAMING SUCCESS: {provider_name}")
                     yield chunk
-            return
+            
+            if chunk_count > 0:
+                return  # Success
+            else:
+                logger.warning(f"⚠️ No chunks from {provider_name}")
+                last_error = f"No chunks from {provider_name}"
                 
         except Exception as e:
-            logger.warning(f"Streaming provider {provider} failed: {str(e)}")
+            error_msg = str(e)
+            logger.warning(f"❌ Streaming {provider_name} failed: {error_msg[:100]}")
+            last_error = error_msg
             continue
     
-    # All providers failed - raise exception to be handled by generate()
+    # All providers failed
     raise StreamingError(
-        "All providers failed. Please try again later.",
+        f"All {len(providers)} providers failed for streaming model '{model}'. Last error: {last_error}",
         "service_unavailable",
         503
     )
 
+# Load curated models on startup
+load_curated_models()
 
 @app.get("/")
 async def root():
     return {
-        "message": "G4F OpenAI Compatible API Server",
-        "version": "1.0.0",
+        "message": "G4F Optimized API - Curated Working Models Only",
+        "version": "3.0.0",
+        "features": [
+            "Curated working models only",
+            "Free provider rotation",
+            "No authentication required",
+            "Model categorization",
+            "OpenAI compatibility"
+        ],
+        "model_categories": {
+            "coding": len([m for m, c in MODEL_CATEGORIES.items() if c == 'coding']),
+            "chat": len([m for m, c in MODEL_CATEGORIES.items() if c == 'chat']),
+            "deep_thinking": len([m for m, c in MODEL_CATEGORIES.items() if c == 'deep_thinking'])
+        },
+        "total_models": len(CURATED_MODELS),
         "endpoints": {
             "models": "/v1/models",
-            "chat_completions": "/v1/chat/completions"
+            "chat_completions": "/v1/chat/completions",
+            "health": "/health"
         }
     }
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "curated_models": len(CURATED_MODELS),
+        "free_providers": len(FREE_PROVIDERS)
+    }
 
-@app.get("/v1/models", response_model=ModelsResponse)
+@app.get("/v1/models")
 async def list_models():
-    """List all available models"""
-    models = []
+    """List all curated models"""
+    models_list = []
+    for model_info in AVAILABLE_MODELS.values():
+        models_list.append(ModelInfo(**model_info))
     
-    # Get all unique models from our mapping
-    all_models = set(PROVIDER_MODEL_MAP.keys())
-    all_models.update(MODEL_ALIASES.keys())
-    all_models.discard("default")
-    
-    for model_id in sorted(all_models):
-        models.append(ModelInfo(
-            id=model_id,
-            created=int(time.time()),
-            owned_by="g4f"
-        ))
-    
-    return ModelsResponse(data=models)
-
+    return ModelsResponse(data=models_list)
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
-    """Create a chat completion (OpenAI compatible)"""
+    """Create chat completion with curated models only"""
     try:
-        # Normalize model name
-        model = normalize_model_name(request.model)
+        requested_model = request.model
         
-        # Get available providers for this model
-        providers = get_available_providers(model)
+        # Check if model is in our curated list
+        if requested_model not in CURATED_MODELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{requested_model}' not available. Use /v1/models to see available models."
+            )
+        
+        # Get providers for this curated model
+        providers = CURATED_MODELS[requested_model]
         
         if not providers:
             raise HTTPException(
-                status_code=400,
-                detail=f"No providers available for model: {request.model}"
+                status_code=500,
+                detail=f"No providers configured for model: {requested_model}"
             )
         
         # Convert messages to dict format
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        
+        # Prepare kwargs
+        kwargs = {}
+        if request.temperature is not None:
+            kwargs['temperature'] = request.temperature
+        if request.max_tokens is not None:
+            kwargs['max_tokens'] = request.max_tokens
+        if request.top_p is not None:
+            kwargs['top_p'] = request.top_p
+        
+        category = MODEL_CATEGORIES.get(requested_model, 'general')
+        logger.info(f"🎯 Using {category} model: {requested_model} with {len(providers)} providers")
         
         if request.stream:
             # Handle streaming response
@@ -443,7 +413,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                         "id": request_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
-                        "model": request.model,
+                        "model": requested_model,
                         "choices": [{
                             "index": 0,
                             "delta": {"role": "assistant", "content": ""},
@@ -453,15 +423,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
                     yield f"data: {json.dumps(initial_chunk)}\n\n"
                     
                     # Stream content
-                    full_content = ""
-                    async for chunk in try_providers_stream(model, messages, providers):
+                    async for chunk in try_providers_stream(requested_model, messages, providers, **kwargs):
                         if chunk.strip():
-                            full_content += chunk
                             chunk_data = {
                                 "id": request_id,
                                 "object": "chat.completion.chunk",
                                 "created": int(time.time()),
-                                "model": request.model,
+                                "model": requested_model,
                                 "choices": [{
                                     "index": 0,
                                     "delta": {"content": chunk},
@@ -475,7 +443,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                         "id": request_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
-                        "model": request.model,
+                        "model": requested_model,
                         "choices": [{
                             "index": 0,
                             "delta": {},
@@ -486,7 +454,6 @@ async def create_chat_completion(request: ChatCompletionRequest):
                     yield "data: [DONE]\n\n"
                     
                 except StreamingError as e:
-                    # Handle streaming error - emit error event and terminate
                     error_data = {
                         "error": {
                             "message": e.message,
@@ -498,10 +465,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
                     yield "data: [DONE]\n\n"
             
             return StreamingResponse(
-                generate(), 
+                generate(),
                 media_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache", 
+                    "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Headers": "*"
@@ -510,13 +477,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
         
         else:
             # Handle non-streaming response
-            content = await try_providers(model, messages, providers)
+            content = await try_providers(requested_model, messages, providers, **kwargs)
             
             # Create OpenAI-compatible response
             response = ChatCompletionResponse(
                 id=f"chatcmpl-{int(time.time())}",
                 created=int(time.time()),
-                model=request.model,
+                model=requested_model,
                 choices=[ChatChoice(
                     index=0,
                     message=ChatMessage(role="assistant", content=content),
@@ -532,7 +499,6 @@ async def create_chat_completion(request: ChatCompletionRequest):
             return response
             
     except HTTPException as he:
-        # Return JSONResponse for OpenAI-compatible error format
         return JSONResponse(
             status_code=he.status_code,
             content=create_openai_error(
@@ -543,7 +509,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
             )
         )
     except Exception as e:
-        logger.error(f"Error in chat completion: {str(e)}")
+        logger.error(f"❌ Error in chat completion: {str(e)}")
         return JSONResponse(
             status_code=500,
             content=create_openai_error(
@@ -554,13 +520,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
             )
         )
 
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-
 if __name__ == "__main__":
     import uvicorn
+    logger.info("🚀 Starting G4F Optimized API with curated models...")
     uvicorn.run(app, host="0.0.0.0", port=5000)
