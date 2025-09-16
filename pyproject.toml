@@ -1,0 +1,12 @@
+[project]
+name = "g4f_proxy"
+version = "0.1.0"
+description = "LLM Api Free Sever From g4f Working Models"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.116.1",
+    "g4f>=0.6.2.9",
+    "pydantic>=2.11.9",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.35.0",
+]
